@@ -2,6 +2,7 @@
 #define __WFC_H__
 
 #include <stdint.h>
+#include <assert.h>
 
 
 #define WFC_TILE_NUM_CELLS 4
@@ -9,8 +10,6 @@
 #define WFC_PATTERN_LEN (WFC_N * WFC_N)
 #define WFC_CELL_NUM_BITS 4
 #define WFC_CELL_MASK ((1 << WFC_CELL_NUM_BITS) - 1)
-
-// TODO static assert cell num bits and num cells fits into file
 
 
 typedef uint8_t WFC_Value;
@@ -41,18 +40,21 @@ typedef struct WFC_Pos {
 } WFC_Pos;
 
 typedef uint16_t WFC_Tile;
+static_assert((sizeof(WFC_Tile) * 8) == (WFC_PATTERN_LEN * WFC_TILE_NUM_CELLS));
 
 typedef struct WFC_Pattern {
-    uint32_t index;
-	uint32_t count;
-    WFC_Tile tile;
+    uint32_t index; /* index into the propagator's pattern array */
+	uint32_t count; /* number of times the pattern occurred in the input image */
+    WFC_Tile tile; /* 2x2 tile pattern */
 } WFC_Pattern;
 
 typedef struct WFC_Propagator {
     uint32_t max_patterns;
     uint32_t num_patterns;
     WFC_Pattern *patterns;
-    uint8_t *index;
+
+    uint32_t bitmap_len;
+    uint8_t *index; /* Patterns x Adjacency x Pattern where the last dimension is a bitmap */
 } WFC_Propagator;
 
 typedef struct WFC_State {
@@ -62,7 +64,7 @@ typedef struct WFC_State {
     uint32_t input_height;
     uint8_t *input;
 
-    uint8_t *output;
+    uint8_t *output; /* Array of bitmaps indicating which tiles are valid for each output image pixel */
 } WFC_State;
 
 WFC_RESULT_ENUM WFC_StateInit(WFC_State *state, uint32_t input_width, uint32_t input_height, const uint8_t *input);
@@ -76,8 +78,13 @@ void WFC_PrintState(WFC_State *state);
 
 /*
 
+// TODO write step function
 WFC_RESULT_ENUM WFC_Step(WFC_State *state);
 
+// Create an output image of 4bit colors by copying the state->output bitmaps
+// into the output image.
+// TODO either average the tile color values, or return an error if there is
+// more then one possible color for a tile.
 WFC_RESULT_ENUM WFC_Output(WFC_State *state, uint8_t *output);
 */
 

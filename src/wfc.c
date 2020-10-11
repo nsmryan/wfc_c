@@ -6,15 +6,22 @@
 #include <stdio.h>
 #include <assert.h>
 
+#include "log.h"
+
 #include "wfc.h"
 
 
-#define WFC_ADJACENT_BYTES_NEEDED(num_patterns) ((num_patterns / 8UL) + ((num_patterns % 8) != 0))
-#define WFC_PATTERN_BYTES_NEEDED(num_patterns) (WFC_ADJACENT_BYTES_NEEDED(num_patterns) * WFC_NUM_ADJACENT)
-#define WFC_INDEX_LENGTH_BYTES(num_patterns) (WFC_PATTERN_BYTES_NEEDED(num_patterns) * num_patterns)
+// bytes needed to create a bitmap with one bit per pattern
+#define WFC_BITMAP_BYTES_NEEDED(num_patterns) ((num_patterns / 8UL) + ((num_patterns % 8) != 0))
+
+// number of bytes needed for one bitmap per adjacency type
+#define WFC_PATTERN_BYTES_NEEDED(num_patterns) (WFC_BITMAP_BYTES_NEEDED(num_patterns) * WFC_NUM_ADJACENT)
+
+// length of the index (number of patterns times bitmap length for each pattern)
+#define WFC_INDEX_LENGTH_BYTES(num_patterns) (num_patterns * WFC_PATTERN_BYTES_NEEDED(num_patterns))
 
 #define WFC_PATTERN_INDEX(num_patterns, pattern) (WFC_PATTERN_BYTES_NEEDED(num_patterns) * pattern)
-#define WFC_ADJACENT_INDEX(num_patterns, adjacent) (WFC_ADJACENT_BYTES_NEEDED(num_patterns) * adjacent)
+#define WFC_ADJACENT_INDEX(num_patterns, adjacent) (WFC_BITMAP_BYTES_NEEDED(num_patterns) * adjacent)
 
 
 const WFC_Pos gv_adjacent_offsets[WFC_NUM_ADJACENT] =
@@ -36,6 +43,13 @@ const WFC_Pos gv_pattern_offsets[WFC_PATTERN_LEN] =
     };
 
 
+// check if 'tile' overlaps with 'other_tile', if 'other_tile' is offset by 'adjacency'.
+static bool WFC_TilesOverlap(WFC_Tile tile, WFC_Tile other_tile, WFC_Pos adjacency);
+
+// helper functions to check tile overlaps
+static WFC_Tile WFC_MaskTile(WFC_Tile tile, WFC_Pos adjacency);
+static WFC_Tile WFC_ShiftTile(WFC_Tile tile, WFC_Pos adjacency);
+
 
 WFC_RESULT_ENUM WFC_StateInit(WFC_State *state, uint32_t input_width, uint32_t input_height, const uint8_t *input) {
     WFC_RESULT_ENUM result = WFC_RESULT_OKAY;
@@ -45,6 +59,7 @@ WFC_RESULT_ENUM WFC_StateInit(WFC_State *state, uint32_t input_width, uint32_t i
     }
 
     if (WFC_RESULT_OKAY == result) {
+        log_trace("WFC checking input");
         // check that input does not contain values >= 16
         for (uint32_t input_index = 0; input_index < input_width * input_height; input_index++) {
             if ((input[input_index] & (~WFC_CELL_MASK)) != 0) {
@@ -55,6 +70,7 @@ WFC_RESULT_ENUM WFC_StateInit(WFC_State *state, uint32_t input_width, uint32_t i
     }
 
     if (WFC_RESULT_OKAY == result) {
+        log_trace("WFC initializing state");
         // copy input buffer to ensure we can clean up at the end
         uint32_t input_size_bytes = input_width * input_height;
 
@@ -74,13 +90,15 @@ WFC_RESULT_ENUM WFC_StateInit(WFC_State *state, uint32_t input_width, uint32_t i
     }
 
     if (WFC_RESULT_OKAY == result) {
+        log_trace("WFC finding patterns");
         // collect patterns from input into a table
         result = WFC_FindPatterns(state);
     }
 
     if (WFC_RESULT_OKAY == result) {
+        log_trace("WFC allocating index");
         // create the index (table of adjacent patterns for each pattern)
-        uint8_t *index = (uint8_t*)malloc(WFC_INDEX_LENGTH_BYTES(state->propagator.num_patterns));
+        uint8_t *index = (uint8_t*)calloc(1, WFC_INDEX_LENGTH_BYTES(state->propagator.num_patterns));
 
         if (NULL == index) {
             result = WFC_RESULT_ERROR;
@@ -90,8 +108,32 @@ WFC_RESULT_ENUM WFC_StateInit(WFC_State *state, uint32_t input_width, uint32_t i
     }
 
     if (WFC_RESULT_OKAY == result) {
+        log_trace("WFC initializing index");
         // fill the index with the discovered patterns and their adjacency information
         result = WFC_IndexInit(state);
+    }
+
+    if (WFC_RESULT_OKAY == result) {
+        log_trace("WFC setting up output map");
+        state->propagator.bitmap_len =
+            (state->propagator.num_patterns / 8) + 
+            ((state->propagator.num_patterns % 8) != 0);
+        uint32_t num_pixels = state->input_width * state->input_height;
+        log_trace("Output bitmap length %d", state->propagator.bitmap_len);
+
+        // allocate a bitmap for each pixel
+        state->output = (uint8_t*)calloc(state->propagator.bitmap_len, num_pixels);
+        assert(NULL != state->output);
+
+        // initial each bitmap to all 1, indicating that all patterns are valid
+        // NOTE this could be done by setting 0xFF in each byte. The current approach at
+        // least only sets bits that are actually used.
+        for (uint32_t pix_index = 0; pix_index < num_pixels; pix_index++) {
+            for (uint32_t pat_index = 0; pat_index < state->propagator.num_patterns; pat_index++) {
+                uint32_t bitmap_offset = pix_index * (state->propagator.bitmap_len);
+                state->output[bitmap_offset + (pat_index / 8)] |= 1 << (pat_index % 8);
+            }
+        }
     }
 
     return result;
@@ -151,6 +193,9 @@ void WFC_PrintState(WFC_State *state) {
     printf("\n");
 }
 
+/** Offset a given position by a given offset, wrapping around a grid of a given
+ * width and height.
+ */
 WFC_Pos WFC_OffsetFrom(WFC_Pos pos, WFC_Pos offset, uint32_t width, uint32_t height) {
     WFC_Pos loc = pos;
 
@@ -192,6 +237,27 @@ void WFC_TestOffsetFrom(void) {
 }
 #endif
 
+/** Get the WFC_Tile from a given offset. This is a 2x2 pattern
+ * encoded into an integer.
+ */
+WFC_Tile WFC_TileAt(WFC_Pos pos, uint32_t width, uint32_t height, uint8_t *input) {
+    assert(NULL != input);
+
+    WFC_Tile tile = 0;
+
+    for (uint32_t offset_index = 0; offset_index < WFC_PATTERN_LEN; offset_index++) {
+        WFC_Pos offset = gv_pattern_offsets[offset_index];
+
+        WFC_Pos loc = WFC_OffsetFrom(pos, offset, width, height);
+
+        tile = tile << WFC_CELL_NUM_BITS;
+
+        tile |= input[loc.x + loc.y * width];
+    }
+
+    return tile;
+}
+
 WFC_RESULT_ENUM WFC_FindPatterns(WFC_State *state) {
     WFC_RESULT_ENUM result = WFC_RESULT_OKAY; 
 
@@ -201,16 +267,11 @@ WFC_RESULT_ENUM WFC_FindPatterns(WFC_State *state) {
         for (uint32_t x = 0; x < state->input_width; x++) {
             WFC_Pos pos = { x, y };
 
+            // get the tile at the current location
             WFC_Pattern pattern = {0};
-            for (uint32_t offset_index = 0; offset_index < WFC_PATTERN_LEN; offset_index++) {
-                WFC_Pos offset = gv_pattern_offsets[offset_index];
+            pattern.tile = WFC_TileAt(pos, state->input_width, state->input_height, state->input);
 
-                WFC_Pos loc = WFC_OffsetFrom(pos, offset, state->input_width, state->input_height);
-
-                pattern.tile = pattern.tile << WFC_CELL_NUM_BITS;
-                pattern.tile |= state->input[loc.x + loc.y * state->input_width];
-            }
-
+            // check if the pattern is already defined
             // NOTE a hash table or set structure may be faster then this linear search
             bool pattern_found = false;
             for (uint32_t pattern_index = 0; pattern_index < state->propagator.num_patterns; pattern_index++) {
@@ -221,13 +282,16 @@ WFC_RESULT_ENUM WFC_FindPatterns(WFC_State *state) {
                 }
             }
 
+            // if not defined, add to the propagator table
             if (!pattern_found) {
+                // if we have not yet allocated the patterns table, allocate it now.
                 if (state->propagator.patterns == NULL) {
                     state->propagator.max_patterns = 1;
-                    state->propagator.patterns = (WFC_Pattern*)malloc(sizeof(WFC_Pattern));
+                    state->propagator.patterns = (WFC_Pattern*)calloc(1, sizeof(WFC_Pattern));
                     assert(NULL != state->propagator.patterns);
                 }
 
+                // check that we have space for one more pattern. If not, realloc
                 if ((state->propagator.num_patterns + 1) == state->propagator.max_patterns) {
                     uint32_t new_size = state->propagator.max_patterns * sizeof(WFC_Pattern) * 2;
 
@@ -257,12 +321,110 @@ WFC_RESULT_ENUM WFC_IndexInit(WFC_State *state) {
 
     assert(NULL != state);
 
+    const uint32_t num_patterns = state->propagator.num_patterns;
+
+    //   NOTE could do triangular matrix and mark opposite adjacencies as you go
+    for (uint32_t pat_index = 0; pat_index < num_patterns; pat_index++) {
+        WFC_Tile tile = state->propagator.patterns[pat_index].tile;
+
+        uint32_t pattern_bitmap_offset = pat_index * WFC_PATTERN_BYTES_NEEDED(num_patterns);
+
+        for (uint8_t adj_index = 0; adj_index < WFC_NUM_ADJACENT; adj_index++) {
+            uint32_t bitmap_offset =
+                pattern_bitmap_offset + adj_index * WFC_BITMAP_BYTES_NEEDED(num_patterns);
+
+            for (uint32_t other_pat_index = 0; other_pat_index < num_patterns; other_pat_index++) {
+                WFC_Tile other_tile = state->propagator.patterns[other_pat_index].tile;
+
+                // if the tiles overlap with the given adjacency, mark the bit
+                if (WFC_TilesOverlap(tile, other_tile, gv_adjacent_offsets[adj_index])) {
+                    state->propagator.index[bitmap_offset + (other_pat_index / 8)] |=
+                        1 << (other_pat_index % 8);
+                }
+            }
+        }
+    }
+
     return result;
 }
+
+WFC_Tile WFC_MaskTile(WFC_Tile tile, WFC_Pos adjacency) {
+    uint16_t tile_part = tile;
+
+    // TODO(perf) consider something like
+    //
+    // initiailze to no mask (keep all bits)
+    // uint16_t x_mask = 0xFFFF;
+    // flip mask if negative, and set to 0 if x == 0
+    // x_mask &= (0x0F0F ^ (0xFFFF * (adjacency.x < 0))) * (adjacency.x != 0);
+    //
+    // uint16_t y_mask = 0xFFFF;
+    // y_mask = (0x00FF ^ (0xFFFF * (adjacency.y < 0))) * (adjacency.x != 0);
+    // return tile & x_mask & y_mask;
+    if (adjacency.x == 1) {
+        tile_part &= 0x0F0F;
+    } else if (adjacency.x == -1) {
+        tile_part &= 0xF0F0;
+    }
+
+    if (adjacency.y == 1) {
+        tile_part &= 0x00FF;
+    } else if (adjacency.y == -1) {
+        tile_part &= 0xFF00;
+    }
+
+    return tile_part;
+}
+
+WFC_Tile WFC_ShiftTile(WFC_Tile tile, WFC_Pos adjacency) {
+    uint16_t tile_part = tile;
+
+    if (adjacency.x == 1) {
+        tile_part = tile_part << 4;
+    } else if (adjacency.x == -1) {
+        tile_part = tile_part >> 4;
+    }
+
+    if (adjacency.y == 1) {
+        tile_part = tile_part << 8;
+    } else if (adjacency.y == -1) {
+        tile_part = tile_part >> 8;
+    }
+
+    return tile_part;
+}
+
+bool WFC_TilesOverlap(WFC_Tile tile, WFC_Tile other_tile, WFC_Pos adjacency) {
+    uint16_t tile_part = WFC_ShiftTile(WFC_MaskTile(tile, adjacency), adjacency);
+    uint16_t other_tile_part = WFC_MaskTile(other_tile, (WFC_Pos){-adjacency.x, -adjacency.y});
+    //log_trace("%04X tile", tile_part);
+    //log_trace("%04X other", other_tile_part);
+
+    return tile_part == other_tile_part;
+}
+
+#if defined(WFC_TEST)
+void WFC_TestTileOverlap(void) {
+    assert(WFC_TilesOverlap(0x0001, 0x1000, (WFC_Pos){1, 1}));
+    assert(WFC_TilesOverlap(0x1234, 0x4321, (WFC_Pos){1, 1}));
+
+    assert(WFC_TilesOverlap(0x1234, 0x2040, (WFC_Pos){1, 0}));
+    assert(WFC_TilesOverlap(0x1234, 0x2948, (WFC_Pos){1, 0}));
+
+    assert(WFC_TilesOverlap(0x1234, 0x3400, (WFC_Pos){0, 1}));
+
+    assert(WFC_TilesOverlap(0x1234, 0x0001, (WFC_Pos){-1, -1}));
+
+    assert(WFC_TilesOverlap(0x1234, 0x0103, (WFC_Pos){-1, 0}));
+
+    assert(WFC_TilesOverlap(0x1234, 0x0012, (WFC_Pos){0, -1}));
+}
+#endif
 
 #if defined(WFC_TEST)
 void WFC_Test(void) {
     WFC_TestOffsetFrom();
+    WFC_TestTileOverlap();
 }
 #endif
 
