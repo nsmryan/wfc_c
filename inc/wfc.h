@@ -57,17 +57,38 @@ typedef struct WFC_Propagator {
     uint8_t *index; /* Patterns x Adjacency x Pattern where the last dimension is a bitmap */
 } WFC_Propagator;
 
+// NOTE used more like a stack than a queue
+typedef struct WFC_Queue {
+    WFC_Pos *items;
+    uint32_t num_items;
+    uint32_t max_items;
+} WFC_Queue;
+
 typedef struct WFC_State {
     WFC_Propagator propagator;
+    uint32_t step_num;
 
+    uint32_t rng;
+
+    // TODO split some of these into structures
     uint32_t input_width;
     uint32_t input_height;
     uint8_t *input;
 
+    uint32_t output_width;
+    uint32_t output_height;
     uint8_t *output; /* Array of bitmaps indicating which tiles are valid for each output image pixel */
+
+    WFC_Queue queue;
 } WFC_State;
 
-WFC_RESULT_ENUM WFC_StateInit(WFC_State *state, uint32_t input_width, uint32_t input_height, const uint8_t *input);
+WFC_RESULT_ENUM WFC_StateInit(WFC_State *state,
+                              uint32_t input_width,
+                              uint32_t input_height,
+                              const uint8_t *input,
+                              uint32_t output_width,
+                              uint32_t output_height,
+                              uint8_t *output);
 void WFC_StateDestroy(WFC_State *state);
 
 WFC_RESULT_ENUM WFC_FindPatterns(WFC_State *state);
@@ -76,10 +97,10 @@ WFC_Pos WFC_OffsetFrom(WFC_Pos pos, WFC_Pos offset, uint32_t width, uint32_t hei
 
 void WFC_PrintState(WFC_State *state);
 
+WFC_RESULT_ENUM WFC_Step(WFC_State *state);
+
 /*
 
-// TODO write step function
-WFC_RESULT_ENUM WFC_Step(WFC_State *state);
 
 // Create an output image of 4bit colors by copying the state->output bitmaps
 // into the output image.

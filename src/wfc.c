@@ -50,8 +50,16 @@ static bool WFC_TilesOverlap(WFC_Tile tile, WFC_Tile other_tile, WFC_Pos adjacen
 static WFC_Tile WFC_MaskTile(WFC_Tile tile, WFC_Pos adjacency);
 static WFC_Tile WFC_ShiftTile(WFC_Tile tile, WFC_Pos adjacency);
 
+// get a pointer to the output array's pattern bitmap for a particular pixel
+static uint8_t *WFC_GetOutputBitmap(WFC_State *state, WFC_Pos pos);
 
-WFC_RESULT_ENUM WFC_StateInit(WFC_State *state, uint32_t input_width, uint32_t input_height, const uint8_t *input) {
+
+WFC_RESULT_ENUM WFC_StateInit(WFC_State *state,
+                              uint32_t input_width,
+                              uint32_t input_height,
+                              const uint8_t *input
+                              uint32_t output_width,
+                              uint32_t output_height) {
     WFC_RESULT_ENUM result = WFC_RESULT_OKAY;
 
     if ((NULL == state) || (NULL == input)) {
@@ -70,6 +78,10 @@ WFC_RESULT_ENUM WFC_StateInit(WFC_State *state, uint32_t input_width, uint32_t i
     }
 
     if (WFC_RESULT_OKAY == result) {
+        memset(state, 0, sizeof(*state));
+
+        state->rng = 7;
+
         log_trace("WFC initializing state");
         // copy input buffer to ensure we can clean up at the end
         uint32_t input_size_bytes = input_width * input_height;
@@ -86,6 +98,16 @@ WFC_RESULT_ENUM WFC_StateInit(WFC_State *state, uint32_t input_width, uint32_t i
             state->input = input_copy;
             state->input_width = input_width;
             state->input_height = input_height;
+        }
+    }
+
+    if (result == WFC_RESULT_OKAY) {
+        state->queue.num_items = 0;
+        state->queue.max_items = output_width * output_height;
+        state->queue.items = (WFC_Pos*)(calloc(1, state->queue.max_items * sizeof(WFC_Pos)));
+
+        if (NULL == state->queue.items) {
+            result = WFC_RESULT_ERROR;
         }
     }
 
@@ -135,6 +157,9 @@ WFC_RESULT_ENUM WFC_StateInit(WFC_State *state, uint32_t input_width, uint32_t i
             }
         }
     }
+
+    // TODO we should probably call WFC_StateDestroy on error to clean up
+    // any allocated memory from a partially constructed state.
 
     return result;
 }
@@ -191,6 +216,14 @@ void WFC_PrintState(WFC_State *state) {
         WFC_PrintTile(pattern.tile);
     }
     printf("\n");
+}
+
+uint8_t *WFC_GetOutputBitmap(WFC_State *state, WFC_Pos pos) {
+    uint32_t pixel_index = pos.x + pos.y * state->output_width;
+    uint32_t output_index =
+         pixel_index * WFC_BITMAP_BYTES_NEEDED(state->propagator.num_patterns);
+
+    return &state->output[output_index];
 }
 
 /** Offset a given position by a given offset, wrapping around a grid of a given
@@ -420,6 +453,185 @@ void WFC_TestTileOverlap(void) {
     assert(WFC_TilesOverlap(0x1234, 0x0012, (WFC_Pos){0, -1}));
 }
 #endif
+
+uint32_t WFC_Entropy(State *state, uint32_t x, uint32_t y) {
+    uint32_t entropy = 0;
+
+    uint8_t *output_bitmap = WFC_GetOutputBitmap(state, (WFC_Pos){x, y});
+
+    for (uint32_t pat_index = 0; pat_index < state->propagator.num_patterns; pat_index++) {
+        if ((output_bitmap[pat_index / 8] & (1 << (pat_index % 8))) != 0) {
+            entropy += state->propagator.patterns[pat_index].count;
+        }
+    }
+
+    return entropy;
+}
+
+WFC_RESULT_ENUM WFC_LowestEntropy(WFC_State *state, WFC_Pos *pos, uint32_t *entropy) {
+    assert(NULL != state);
+    assert(NULL != pos);
+    assert(NULL != entropy);
+
+    uint32_t min_entropy_count = 0;
+    *entropy = 0xFFFFFFFF;
+
+    uint32_t bitmap_len = WFC_BITMAP_BYTES_NEEDED(state->propagator.num_patterns);
+    for (uint32_t y = 0; y < state->output_height; y++) {
+        for (uint32_t x = 0; x < state->output_width; x++) {
+
+            uint32_t current_entropy = WFC_Entropy(state, x, y);
+
+            if (current_entropy == 0) {
+                return WFC_RESULT_RESTART;
+            }
+
+            if (current_entropy < *entropy) {
+                *pos = (WFC_Pos){x, y};
+                min_entropy_count = 0;
+                *entropy = current_entropy;
+            } else if (current_entropy == *entropy) {
+                min_entropy_count++;
+
+                // accept with probability 1 / min_entropy_count
+                float prob = ((1.0 / (float)0xFFFFFFFF)) * WFC_GenRandom(state);
+
+                if (prob < (1.0 / ((float)min_entropy_count))) {
+                    *entropy = current_entropy;
+                    *pos = (WFC_Pos){x, y};
+                }
+            }
+            // otherwise ignore
+        }
+    }
+
+    if (min_entropy == 1) {
+        return WFC_RESULT_OKAY;
+    }
+
+    return WFC_RESULT_CONTINUE;
+}
+
+WFC_RESULT_ENUM WFC_Observe(WFC_State *state, WFC_Pos *pos) {
+    assert(NULL != state);
+    assert(NULL != pos);
+
+    uint32_t entropy = 0;
+
+    WFC_RESULT_ENUM result;
+    result = WFC_LowestEntropy(state, pos, &entropy);
+
+    if (result == WFC_RESULT_CONTINUE) {
+        uint32_t n = WFC_GenRandom(state) % entropy;
+        bool chosen_pattern = false;
+
+        uint8_t *output_bitmap = WFC_GetOutputBitmap(state, *pos);
+
+        for (uint32_t pat_index = 0; pat_index < state->propagator.num_patterns; pat_index++) {
+            // skip patterns that are not available for selection
+            if (output_bitmap[(pat_index / 8)] & (1 << (pat_index % 8)) == 0) {
+                continue
+            }
+
+            if (chosen_pattern) {
+                // clear all remaining patterns once we have chosen one
+                output_bitmap[(pat_index / 8)] &= ~(1 << (pat_index % 8));
+            } else {
+                uint32_t pat_count = state->propagator.patterns[pat_index].count;
+
+                if (entropy < count) {
+                    // we found our chosen pattern
+                    chosen_pattern = true;
+                    // we leave the pattern bit set here to select it
+                    break;
+                } else {
+                    // this is not our chosen pattern so clear it an remove its count
+                    output_bitmap[(pat_index / 8)] &= ~(1 << (pat_index % 8));
+                    entropy -= count;
+                }
+            }
+        }
+        // check that we did actually choose a pattern
+        assert(chosen_pattern);
+    }
+
+    return result;
+}
+
+WFC_RESULT_ENUM WFC_Propagate(WFC_State *state, WFC_Pos start_pos) {
+    assert(NULL != state);
+
+    state->queue.items[0] = start_pos;
+    state->queue.num_items = 1;
+
+    while (state->queue.num_items > 0) {
+        // pop off an item
+        state->queue.num_items--;
+        WFC_Pos cur_pos = state->queue.items[state->queue.num_items];
+
+        uint8_t *output_bitmap = WFC_GetOutputBitmap(state, cur_pos);
+
+        for (uint32_t adj_index = 0; adj_index < WFC_NUM_ADJACENT; adj_index++) {
+            WFC_Pos adjacency = gv_adjacent_offsets[adj_index];
+            WFC_Pos other_pos = WFC_OffsetFrom(pos, adjacency, state->output_width, state->output_height);
+
+            uint8_t *other_output_bitmap = WFC_GetOutputBitmap(state, other_pos);
+
+            for (uint32_t pat_index = 0; pat_index < state->propagator.num_patterns; pat_index++) {
+                // if the pattern is not currently valid, skip it
+                // TODO wrap pattern stuff in functions to avoid duplication like this
+                if (state->output[output_index + (pat_index / 8)] & (1 << (pat_index % 8)) == 0) {
+                    continue
+                }
+
+                WFC_Tile tile = state->propagator.patterns[pat_index].tile;
+
+                for (uint32_t other_pat_index = 0; other_pat_index < state->propagator.num_patterns; other_pat_index++) {
+                    // TODO what about if this pattern is 0 already?
+
+                    WFC_Tile other_tile = state->propagator.patterns[other_pat_index].tile;
+
+                    if (!WFC_TilesOverlap(tile, other_tile, adjacency)) {
+                        // TODO the tiles do not overlap, so remove other_pat_index from the other cell and
+                        // mark it as needing queueing. Then, after the loop, queue if needed
+                        // NOTE this is wrong- we need the output index of the other cell, not the current cell
+                        // this is a good argument for abstraction to avoid lots of duplicate logic
+                        //state->output[output_index + (pat_index / 8)] &= ~(1 << (pat_index % 8));
+                    }
+                }
+            }
+        }
+    }
+}
+
+WFC_RESULT_ENUM WFC_Step(WFC_State *state) {
+    assert(NULL != state);
+
+    WFC_Pos pos;
+
+    WFC_RESULT_ENUM result;
+    result = WFC_Observe(state, &pos);
+
+    if (result == WFC_RESULT_CONTINUE) {
+        WFC_Propagate(state, pos);
+    }
+
+    return result;
+}
+
+uint32_t WFC_GenRandom(WFC_State *state) {
+    state->rng = random(state->rng);
+
+    return state->rng;
+}
+
+static uint32_t random(uint32_t seed)
+{
+  seed ^= seed << 13;
+  seed ^= seed >> 17;
+  seed ^= seed << 5;
+  return seed;
+}
 
 #if defined(WFC_TEST)
 void WFC_Test(void) {

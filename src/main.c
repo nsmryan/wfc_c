@@ -15,6 +15,10 @@ char gv_input[] =
 const uint32_t gv_width = 4;
 const uint32_t gv_height = 4;
 
+const uint32_t gv_output_width = 20;
+const uint32_t gv_output_height = 20;
+
+
 int main(int argc, char *argv[]) {
     printf("Hello, wfc\n");
 
@@ -25,7 +29,7 @@ int main(int argc, char *argv[]) {
     }
 
     WFC_State state = {0};
-    result = WFC_StateInit(&state, gv_width, gv_height, (const uint8_t*)gv_input);
+    result = WFC_StateInit(&state, gv_width, gv_height, (const uint8_t*)gv_input, gv_output_width, gv_output_height);
     assert(WFC_RESULT_OKAY == result);
 
     WFC_PrintState(&state);
